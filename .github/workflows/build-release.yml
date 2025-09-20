@@ -1,4 +1,4 @@
-name: Build & Release (Reusable)
+name: Build & release (reusable workflow)
 
 on:
   workflow_call:
@@ -39,14 +39,13 @@ on:
         default: true
       artifact_retention_days:
         description: "Artifact retention days"
-        type: number
-        default: 7
+        type: string
+        default: "7"
       working_directory:
         description: "Optional working directory (relative path)"
         type: string
         default: ""
 
-# Default to least privilege for the entire workflow
 permissions:
   contents: read
 
@@ -57,8 +56,8 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-    # Shadow the runtime token so untrusted build steps can't read it
     env:
+      # Shadow it so untrusted build steps can't read it
       GITHUB_TOKEN: ""
 
     outputs:
@@ -67,22 +66,17 @@ jobs:
 
     steps:
       - name: Guard supported events
-        if: ${{ !contains(fromJson('["workflow_call","workflow_dispatch","push"]'), github.event_name) }}
-        run: echo "Unsupported event: ${{ github.event_name }}" && exit 1
+        if: ${{ !(github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' || github.event_name == 'push') }}
+        run: |
+          echo "Unsupported event: ${{ github.event_name }}"
+          exit 1
 
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          token: ${{ github.token }}         # explicit; not exposed to later shell steps
+          token: ${{ github.token }}
           persist-credentials: false
           fetch-depth: 1
-
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: ${{ inputs.node_version }}
-          cache: npm
-          cache-dependency-path: ${{ inputs.working_directory != '' && format('{0}/package-lock.json', inputs.working_directory) || 'package-lock.json' }}
 
       - name: Sanitize inputs (workdir, prefix)
         id: sanitize
@@ -91,17 +85,32 @@ jobs:
           set -euo pipefail
           wd='${{ inputs.working_directory }}'
           if [[ -n "$wd" ]]; then
-            # must be relative; no traversal; limited charset
             if [[ "$wd" == /* || "$wd" == *".."* || ! "$wd" =~ ^[A-Za-z0-9._/-]+$ ]]; then
               echo "Invalid working_directory: $wd" >&2; exit 1
             fi
             echo "WORKDIR=$wd" >> "$GITHUB_ENV"
           fi
-
           prefix='${{ inputs.package_prefix }}'
-          # allow alnum, dot, underscore, dash
           prefix_sanitized="$(printf '%s' "$prefix" | tr -cd 'A-Za-z0-9._-')"
           echo "PKG_PREFIX=$prefix_sanitized" >> "$GITHUB_ENV"
+
+      - name: Compute dependency path
+        id: dep
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -n "${WORKDIR:-}" ]]; then
+            echo "path=$WORKDIR/package-lock.json" >> "$GITHUB_OUTPUT"
+          else
+            echo "path=package-lock.json" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+          cache: npm
+          cache-dependency-path: ${{ steps.dep.outputs.path }}
 
       - name: Optional setup (sanitized)
         if: ${{ inputs.setup_commands != '' }}
@@ -109,7 +118,6 @@ jobs:
         run: |
           set -euo pipefail
           echo '${{ inputs.setup_commands }}' > _setup.txt
-          # deny dangerous shell metacharacters (still not a sandbox)
           if grep -nE '[`$|&;<>]' _setup.txt; then
             echo "setup_commands contain disallowed metacharacters" >&2; exit 1
           fi
@@ -148,7 +156,6 @@ jobs:
           rm -rf dist && mkdir -p dist
           while IFS= read -r f; do
             [[ -z "$f" ]] && continue
-            # refuse absolute paths and traversal
             case "$f" in
               /*|*../*|../* ) echo "Refusing path: $f" >&2; exit 1;;
             esac
@@ -178,7 +185,7 @@ jobs:
         with:
           name: dist
           path: ${{ inputs.working_directory != '' && format('{0}/dist', inputs.working_directory) || 'dist' }}
-          retention-days: ${{ inputs.artifact_retention_days }}
+          retention-days: "${{ inputs.artifact_retention_days }}"
 
       - name: Upload package
         uses: actions/upload-artifact@v4
@@ -186,7 +193,7 @@ jobs:
           name: ${{ steps.pkg.outputs.zip_name }}
           path: ${{ inputs.working_directory != '' && format('{0}/package/{1}', inputs.working_directory, steps.pkg.outputs.zip_name) || format('package/{0}', steps.pkg.outputs.zip_name) }}
           if-no-files-found: error
-          retention-days: ${{ inputs.artifact_retention_days }}
+          retention-days: "${{ inputs.artifact_retention_days }}"
 
   release:
     needs: build
@@ -194,7 +201,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-
     steps:
       - name: Download packaged artifact
         uses: actions/download-artifact@v4
