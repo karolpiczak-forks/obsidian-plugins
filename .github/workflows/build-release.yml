@@ -1,0 +1,215 @@
+name: Build & Release (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      dist_files:
+        description: "Newline-separated files to copy into dist/"
+        type: string
+        required: true
+      setup_commands:
+        description: "Optional pre-build commands (sanitized; no shell metacharacters)"
+        type: string
+        default: ""
+      build_commands:
+        description: "Build commands (sanitized)"
+        type: string
+        default: |
+          npm ci
+          npm run build
+      node_version:
+        description: "Node version"
+        type: string
+        default: "22"
+      package_prefix:
+        description: "Zip name prefix (defaults to repo name)"
+        type: string
+        default: ""
+      release_branch:
+        description: "Branch that triggers a release"
+        type: string
+        default: "main"
+      calver_format:
+        description: "date(1) format"
+        type: string
+        default: "+%Y%m%d-%H%M"
+      allow_updates:
+        description: "Update existing release if tag exists"
+        type: boolean
+        default: true
+      artifact_retention_days:
+        description: "Artifact retention days"
+        type: number
+        default: 7
+      working_directory:
+        description: "Optional working directory (relative path)"
+        type: string
+        default: ""
+
+# Default to least privilege for the entire workflow
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # Shadow the runtime token so untrusted build steps can't read it
+    env:
+      GITHUB_TOKEN: ""
+
+    outputs:
+      zip_name: ${{ steps.pkg.outputs.zip_name }}
+      calver: ${{ steps.pkg.outputs.calver }}
+
+    steps:
+      - name: Guard supported events
+        if: ${{ !contains(fromJson('["workflow_call","workflow_dispatch","push"]'), github.event_name) }}
+        run: echo "Unsupported event: ${{ github.event_name }}" && exit 1
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ github.token }}         # explicit; not exposed to later shell steps
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+          cache: npm
+          cache-dependency-path: ${{ inputs.working_directory != '' && format('{0}/package-lock.json', inputs.working_directory) || 'package-lock.json' }}
+
+      - name: Sanitize inputs (workdir, prefix)
+        id: sanitize
+        shell: bash
+        run: |
+          set -euo pipefail
+          wd='${{ inputs.working_directory }}'
+          if [[ -n "$wd" ]]; then
+            # must be relative; no traversal; limited charset
+            if [[ "$wd" == /* || "$wd" == *".."* || ! "$wd" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+              echo "Invalid working_directory: $wd" >&2; exit 1
+            fi
+            echo "WORKDIR=$wd" >> "$GITHUB_ENV"
+          fi
+
+          prefix='${{ inputs.package_prefix }}'
+          # allow alnum, dot, underscore, dash
+          prefix_sanitized="$(printf '%s' "$prefix" | tr -cd 'A-Za-z0-9._-')"
+          echo "PKG_PREFIX=$prefix_sanitized" >> "$GITHUB_ENV"
+
+      - name: Optional setup (sanitized)
+        if: ${{ inputs.setup_commands != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo '${{ inputs.setup_commands }}' > _setup.txt
+          # deny dangerous shell metacharacters (still not a sandbox)
+          if grep -nE '[`$|&;<>]' _setup.txt; then
+            echo "setup_commands contain disallowed metacharacters" >&2; exit 1
+          fi
+          while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            if [[ -n "${WORKDIR:-}" ]]; then
+              (cd "$WORKDIR" && $line)
+            else
+              $line
+            fi
+          done < _setup.txt
+
+      - name: Build (sanitized)
+        if: ${{ inputs.build_commands != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo '${{ inputs.build_commands }}' > _build.txt
+          if grep -nE '[`$|&;<>]' _build.txt; then
+            echo "build_commands contain disallowed metacharacters" >&2; exit 1
+          fi
+          while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            if [[ -n "${WORKDIR:-}" ]]; then
+              (cd "$WORKDIR" && $line)
+            else
+              $line
+            fi
+          done < _build.txt
+
+      - name: Prepare dist
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ -n "${WORKDIR:-}" ]] && cd "$WORKDIR"
+          rm -rf dist && mkdir -p dist
+          while IFS= read -r f; do
+            [[ -z "$f" ]] && continue
+            # refuse absolute paths and traversal
+            case "$f" in
+              /*|*../*|../* ) echo "Refusing path: $f" >&2; exit 1;;
+            esac
+            if [[ -f "$f" ]]; then
+              cp -v -- "$f" dist/
+            else
+              echo "Skipping missing $f"
+            fi
+          done <<< '${{ inputs.dist_files }}'
+
+      - name: Package (CalVer)
+        id: pkg
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ -n "${WORKDIR:-}" ]] && cd "$WORKDIR"
+          CALVER=$(date -u "${{ inputs.calver_format }}")
+          echo "calver=$CALVER" >> "$GITHUB_OUTPUT"
+          prefix="${PKG_PREFIX:-${GITHUB_REPOSITORY##*/}}"
+          ZIP_NAME="${prefix}-${CALVER}.zip"
+          mkdir -p package
+          (cd dist && zip -r "../package/$ZIP_NAME" .)
+          echo "zip_name=$ZIP_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Upload dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: ${{ inputs.working_directory != '' && format('{0}/dist', inputs.working_directory) || 'dist' }}
+          retention-days: ${{ inputs.artifact_retention_days }}
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pkg.outputs.zip_name }}
+          path: ${{ inputs.working_directory != '' && format('{0}/package/{1}', inputs.working_directory, steps.pkg.outputs.zip_name) || format('package/{0}', steps.pkg.outputs.zip_name) }}
+          if-no-files-found: error
+          retention-days: ${{ inputs.artifact_retention_days }}
+
+  release:
+    needs: build
+    if: github.event_name == 'workflow_call' && github.ref == format('refs/heads/{0}', inputs.release_branch)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download packaged artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build.outputs.zip_name }}
+          path: package
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.build.outputs.calver }}
+          name: ${{ format('{0} {1}', (inputs.package_prefix != '' && inputs.package_prefix || github.event.repository.name), needs.build.outputs.calver) }}
+          files: package/${{ needs.build.outputs.zip_name }}
+          generate_release_notes: true
+          allow_updates: ${{ inputs.allow_updates }}
+          fail_on_unmatched_files: true
+          draft: false
+          prerelease: false
