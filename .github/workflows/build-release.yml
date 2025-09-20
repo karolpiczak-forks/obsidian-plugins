@@ -57,8 +57,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     env:
-      # Shadow it so untrusted build steps can't read it
-      GITHUB_TOKEN: ""
+      GITHUB_TOKEN: ""  # shadow token in shell
 
     outputs:
       zip_name: ${{ steps.pkg.outputs.zip_name }}
@@ -123,11 +122,7 @@ jobs:
           fi
           while IFS= read -r line; do
             [[ -z "$line" ]] && continue
-            if [[ -n "${WORKDIR:-}" ]]; then
-              (cd "$WORKDIR" && $line)
-            else
-              $line
-            fi
+            if [[ -n "${WORKDIR:-}" ]]; then (cd "$WORKDIR" && $line); else $line; fi
           done < _setup.txt
 
       - name: Build (sanitized)
@@ -141,11 +136,7 @@ jobs:
           fi
           while IFS= read -r line; do
             [[ -z "$line" ]] && continue
-            if [[ -n "${WORKDIR:-}" ]]; then
-              (cd "$WORKDIR" && $line)
-            else
-              $line
-            fi
+            if [[ -n "${WORKDIR:-}" ]]; then (cd "$WORKDIR" && $line); else $line; fi
           done < _build.txt
 
       - name: Prepare dist
@@ -208,14 +199,21 @@ jobs:
           name: ${{ needs.build.outputs.zip_name }}
           path: package
 
-      - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ needs.build.outputs.calver }}
-          name: ${{ format('{0} {1}', (inputs.package_prefix != '' && inputs.package_prefix || github.event.repository.name), needs.build.outputs.calver) }}
-          files: package/${{ needs.build.outputs.zip_name }}
-          generate_release_notes: true
-          allow_updates: ${{ inputs.allow_updates }}
-          fail_on_unmatched_files: true
-          draft: false
-          prerelease: false
+      - name: Publish GitHub Release (gh)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.build.outputs.calver }}
+          NAME: ${{ format('{0} {1}', (inputs.package_prefix != '' && inputs.package_prefix || github.event.repository.name), needs.build.outputs.calver) }}
+          FILE: package/${{ needs.build.outputs.zip_name }}
+          ALLOW_UPDATES: ${{ inputs.allow_updates }}
+        run: |
+          set -euo pipefail
+          [[ -f "$FILE" ]] || { echo "Missing asset: $FILE"; exit 1; }
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            [[ "$ALLOW_UPDATES" == "true" ]] || { echo "Release exists and updates disabled"; exit 1; }
+            gh release edit "$TAG" --title "$NAME" >/dev/null
+            gh release upload "$TAG" "$FILE" --clobber
+          else
+            gh release create "$TAG" "$FILE" --title "$NAME" --generate-notes
+          fi
