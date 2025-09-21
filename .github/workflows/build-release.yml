@@ -185,7 +185,18 @@ jobs:
           path: ${{ inputs.working_directory != '' && format('{0}/package/{1}', inputs.working_directory, steps.pkg.outputs.zip_name) || format('package/{0}', steps.pkg.outputs.zip_name) }}
           if-no-files-found: error
           retention-days: "${{ inputs.artifact_retention_days }}"
-
+  
+  debug-release-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dump release gate variables
+        run: |
+          echo "github.event_name=${{ github.event_name }}"
+          echo "github.ref_type=${{ github.ref_type }}"
+          echo "github.ref_name=${{ github.ref_name }}"
+          echo "inputs.release_branch=${{ inputs.release_branch }}"
+          echo "gate=${{ github.event_name == 'workflow_call' && github.ref_type == 'branch' && github.ref_name == inputs.release_branch }}"
+  
   release:
     needs: build
     if: >
