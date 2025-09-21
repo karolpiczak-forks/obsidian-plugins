@@ -188,7 +188,11 @@ jobs:
 
   release:
     needs: build
-    if: github.event_name == 'workflow_call' && github.ref == format('refs/heads/{0}', inputs.release_branch)
+    if: >
+      github.event_name == 'workflow_call' &&
+      github.ref_type == 'branch' &&
+      github.ref_name == inputs.release_branch
+    
     runs-on: ubuntu-latest
     permissions:
       contents: write
