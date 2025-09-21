@@ -201,22 +201,28 @@ jobs:
         with:
           name: ${{ needs.build.outputs.zip_name }}
           path: package
-
+      
       - name: Publish GitHub Release (gh)
         env:
           GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
           TAG: ${{ needs.build.outputs.calver }}
           NAME: ${{ format('{0} {1}', (inputs.package_prefix != '' && inputs.package_prefix || github.event.repository.name), needs.build.outputs.calver) }}
           FILE: package/${{ needs.build.outputs.zip_name }}
           ALLOW_UPDATES: ${{ inputs.allow_updates }}
+          TARGET_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           [[ -f "$FILE" ]] || { echo "Missing asset: $FILE"; exit 1; }
-
-          if gh release view "$TAG" >/dev/null 2>&1; then
+      
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
             [[ "$ALLOW_UPDATES" == "true" ]] || { echo "Release exists and updates disabled"; exit 1; }
-            gh release edit "$TAG" --title "$NAME" >/dev/null
-            gh release upload "$TAG" "$FILE" --clobber
+            gh release edit "$TAG" --repo "$REPO" --title "$NAME" >/dev/null
+            gh release upload "$TAG" "$FILE" --repo "$REPO" --clobber
           else
-            gh release create "$TAG" "$FILE" --title "$NAME" --generate-notes
+            gh release create "$TAG" "$FILE" \
+              --repo "$REPO" \
+              --title "$NAME" \
+              --generate-notes \
+              --target "$TARGET_SHA"
           fi
